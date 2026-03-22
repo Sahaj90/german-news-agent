@@ -1,0 +1,24 @@
+# Virtual environment
+ger/
+
+# Environment variables (secrets)
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Original doc (not needed in deployment)
+*.docx
+
+# Temp files
+_docx_content.txt
