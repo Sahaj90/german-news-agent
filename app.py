@@ -21,9 +21,7 @@ from langgraph.graph import StateGraph, START, END
 
 load_dotenv()
 
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  PYDANTIC MODELS                                                        ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
+# PYDANTIC MODELS                                                       
 
 class VocabularyItem(BaseModel):
     word: str = Field(description="The German word")
@@ -41,17 +39,31 @@ class NewsBriefing(BaseModel):
     headline: str = Field(description="A short, level-appropriate briefing headline")
     summary: str = Field(description="Comprehensive multi-paragraph summary of all major news")
     bullet_points: List[str] = Field(description="5-7 key points across all stories")
-    vocabulary: List[VocabularyItem] = Field(description="8-10 key vocabulary words")
-    grammar_spotlights: List[GrammarSpotlight] = Field(description="3 grammar rule spotlights")
+    vocabulary: List[VocabularyItem] = Field(description="10 key vocabulary words")
+    grammar_spotlights: List[GrammarSpotlight] = Field(description="5 grammar rule spotlights")
     source_count: int = Field(default=0, description="Number of source articles used")
 
 
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  NEWS FETCHER  (DW + Tagesschau – both at once)                         ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
 
-DW_FEED = "https://rss.dw.com/rdf/rss-de-top"
-TAGESSCHAU_FEED = "https://www.tagesschau.de/index~rss2.xml"
+# NEWS FETCHER  (DW + Tagesschau)                  
+
+
+import concurrent.futures
+
+DW_FEEDS = [
+    "https://rss.dw.com/rdf/rss-de-top",
+    "https://rss.dw.com/rdf/rss-de-eco",
+    "https://rss.dw.com/rdf/rss-de-science",
+    "https://rss.dw.com/rdf/rss-de-culture",
+    "https://rss.dw.com/rdf/rss-de-sports",
+]
+
+TAGESSCHAU_FEEDS = [
+    "https://www.tagesschau.de/index~rss2.xml",
+    "https://www.tagesschau.de/wirtschaft/index~rss2.xml",
+    "https://www.tagesschau.de/wissen/index~rss2.xml",
+    "https://www.tagesschau.de/ausland/index~rss2.xml",
+]
 
 
 def _parse_feed(url: str, source_name: str, max_items: int = 8) -> list[dict]:
@@ -73,15 +85,50 @@ def _parse_feed(url: str, source_name: str, max_items: int = 8) -> list[dict]:
     return articles
 
 
-def fetch_all_news() -> tuple[list[dict], str]:
+def fetch_all_news(top_n: int = 5, selected_sources: list[str] = None, search_query: str = "") -> tuple[list[dict], str]:
     """
-    Fetch top news from BOTH DW and Tagesschau.
-    Returns (list_of_articles, combined_text_for_llm).
+    Fetch top news from selected sources,
+    then pick the top N articles combined with a fair mix.
     """
-    dw_articles = _parse_feed(DW_FEED, "Deutsche Welle")
-    ts_articles = _parse_feed(TAGESSCHAU_FEED, "Tagesschau")
+    if selected_sources is None:
+        selected_sources = ["Deutsche Welle", "Tagesschau"]
 
-    all_articles = dw_articles + ts_articles
+    # Fetch more items upfront to allow for search filtering
+    def _fetch_concurrently(feed_urls, source_name):
+        results = []
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = [executor.submit(_parse_feed, f, source_name, 30) for f in feed_urls]
+            for future in concurrent.futures.as_completed(futures):
+                results.extend(future.result())
+        
+        # Deduplicate
+        seen = set()
+        unique = []
+        for a in results:
+            if a['url'] not in seen:
+                seen.add(a['url'])
+                unique.append(a)
+        return unique
+
+    dw_articles = _fetch_concurrently(DW_FEEDS, "Deutsche Welle") if "Deutsche Welle" in selected_sources else []
+    ts_articles = _fetch_concurrently(TAGESSCHAU_FEEDS, "Tagesschau") if "Tagesschau" in selected_sources else []
+
+    if search_query:
+        query = search_query.lower()
+        dw_articles = [a for a in dw_articles if query in a["title"].lower() or query in a["description"].lower()]
+        ts_articles = [a for a in ts_articles if query in a["title"].lower() or query in a["description"].lower()]
+
+    # Interleave to get a balanced mix of both sources
+    all_articles = []
+    max_len = max(len(dw_articles), len(ts_articles))
+    for i in range(max_len):
+        if i < len(dw_articles):
+            all_articles.append(dw_articles[i])
+        if i < len(ts_articles):
+            all_articles.append(ts_articles[i])
+
+    # Take top N
+    all_articles = all_articles[:top_n]
 
     # Build a combined text block for the LLM
     text_parts = []
@@ -109,239 +156,130 @@ def try_enrich_article(url: str) -> Optional[str]:
     return None
 
 
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  MASTER PROMPT  (multi-article briefing)                                ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
 
-MASTER_PROMPT = """You are an expert German Language Teacher (DaF – Deutsch als Fremdsprache).
-You will receive multiple news items from Deutsche Welle and Tagesschau.
-Your task is to create a **comprehensive daily news briefing** at the user's CEFR level.
-
-## Task Instructions
-1. **Read all articles**: Identify the most important stories.
-2. **Write a unified briefing**: Cover ALL major stories in a flowing, multi-paragraph summary (4-6 paragraphs). 
-   Each paragraph should cover a different story or theme. Be thorough — the user wants rich detail.
-3. **Extract 5-7 bullet points**: These should capture the key facts across all stories.
-4. **Extract 8-10 vocabulary words**: Pick important words characteristic of this CEFR level.
-   Each word MUST include a realistic example sentence from a news context.
-5. **Grammar Spotlights (3)**: Highlight THREE different grammar rules used in your writing.
-   For each, explain the rule clearly and show a real example from your summary.
-   Pick diverse rules (e.g., one about verb tense, one about sentence structure, one about cases or connectors).
-6. **Output**: Return ONLY a JSON object, no extra text.
-
-## Level-Specific Rules
-
-### B1
-- Grammar: Use Perfekt (not Präteritum). Use "man" instead of passive. Max 15 words per sentence.
-  Use weil, dass, wenn.
-- Vocabulary: Top 2,000 common words. Explain jargon in brackets.
-
-### B2
-- Grammar: Use Passiv (wird gemacht). Use complex connectors (trotzdem, obwohl, während).
-  Max 25 words per sentence.
-- Vocabulary: Thematic/professional terms.
-
-### C1
-- Grammar: Nominalstil (noun-heavy). Konjunktiv I for indirect speech. Genitiv. No length limit.
-- Vocabulary: Academic, nuanced, idiomatic German.
-
-## JSON Output Schema
-Return ONLY this JSON — no markdown fences, no commentary:
-
-{{
-  "headline": "A short daily briefing headline for this level",
-  "summary": "Comprehensive summary covering all major stories (4-6 paragraphs, detailed)",
-  "bullet_points": ["Point 1", "Point 2", "Point 3", "Point 4", "Point 5"],
-  "vocabulary": [
-    {{"word": "German Word", "translation": "English", "example": "A full German example sentence"}},
-    {{"word": "...", "translation": "...", "example": "..."}}
-  ],
-  "grammar_spotlights": [
-    {{
-      "rule_name": "Name of rule 1",
-      "explanation": "Clear explanation in German",
-      "example_from_text": "Sentence from your summary using this rule"
-    }},
-    {{
-      "rule_name": "Name of rule 2",
-      "explanation": "Clear explanation in German",
-      "example_from_text": "Sentence from your summary using this rule"
-    }},
-    {{
-      "rule_name": "Name of rule 3",
-      "explanation": "Clear explanation in German",
-      "example_from_text": "Sentence from your summary using this rule"
-    }}
-  ],
-  "source_count": <number of articles you referenced>
-}}
-"""
-
-
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  LANGGRAPH PIPELINE  (Rewrite → Validate → Retry)                      ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
+# MULTI-AGENT SYSTEM (Journalist → Lexicographer → Grammarian)         
 
 class AgentState(TypedDict):
     combined_text: str
     target_level: str
-    json_text: str
+    headline: str
+    summary: str
+    bullet_points: List[str]
+    vocabulary: List[VocabularyItem]
+    grammar_spotlights: List[GrammarSpotlight]
     result: Optional[NewsBriefing]
-    validation_feedback: str
-    attempts: int
-    error: str
 
+class JournalistOutput(BaseModel):
+    headline: str = Field(description="A short daily briefing headline")
+    summary: str = Field(description="Comprehensive summary covering major stories (4-6 paragraphs)")
+    bullet_points: List[str] = Field(description="5-7 key points across all stories")
 
-def _get_llm() -> ChatOpenAI:
+class LexicographerOutput(BaseModel):
+    vocabulary: List[VocabularyItem] = Field(description="Exactly 10 vocabulary words characteristic of the CEFR level, with English translation and German example")
+
+class GrammarianOutput(BaseModel):
+    grammar_spotlights: List[GrammarSpotlight] = Field(description="Exactly 5 grammar rule spotlights used in the summary, with examples from the text")
+
+def _get_llm():
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key or api_key == "your_openai_api_key_here":
         raise ValueError(
             "OPENAI_API_KEY is not set. Add it to your .env file.\n"
             "Get a key at https://platform.openai.com/api-keys"
         )
-    return ChatOpenAI(model="gpt-4o-mini", temperature=0.4, api_key=api_key)
+    return ChatOpenAI(model="gpt-4o-mini", temperature=0.3, api_key=api_key)
 
+def journalist_node(state: AgentState):
+    llm = _get_llm().with_structured_output(JournalistOutput)
+    prompt = f"""You are an expert German Journalist and Language Teacher. 
+Write a unified news briefing based on the provided articles.
+Target CEFR Level: {state['target_level']}
 
-def rewrite_node(state: AgentState) -> dict:
-    """Call the LLM to produce a combined news briefing."""
-    llm = _get_llm()
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", MASTER_PROMPT),
-        ("human", "Level: {target_level}\n\nArticles:\n{combined_text}"),
-    ])
+## Guidelines:
+- Write a flowing, multi-paragraph summary (4-6 paragraphs) covering all major facts.
+- Extract 5-7 key bullet points mapping the main events.
+- B1: Use Perfekt, 'man', max 15 words/sentence. 
+- B2: Use Passiv, complex connectors, max 25 words/sentence.
+- C1: Use Nominalstil, Konjunktiv I, no length limit.
 
-    # Append feedback on retry
-    combined = state["combined_text"]
-    if state.get("validation_feedback"):
-        combined += (
-            f"\n\n IMPORTANT: Your previous output had issues. "
-            f"Fix these problems: {state['validation_feedback']}"
-        )
+Articles:
+{state['combined_text']}
+"""
+    output = llm.invoke(prompt)
+    return {"headline": output.headline, "summary": output.summary, "bullet_points": output.bullet_points}
 
-    chain = prompt | llm
-    try:
-        response = chain.invoke({
-            "target_level": state["target_level"],
-            "combined_text": combined,
-        })
-        text = response.content.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            text = "\n".join(lines[1:-1]).strip()
-        return {"json_text": text, "attempts": state.get("attempts", 0) + 1, "error": ""}
-    except Exception as e:
-        return {"error": str(e), "attempts": state.get("attempts", 0) + 1}
+def lexicographer_node(state: AgentState):
+    llm = _get_llm().with_structured_output(LexicographerOutput)
+    prompt = f"""You are an expert German Lexicographer for CEFR Level {state['target_level']}.
+Analyze the following news summary and extract exactly 10 important vocabulary words appropriate for {state['target_level']}.
+For each word, provide the English translation and a German example sentence from a news context.
 
+Summary:
+{state['summary']}
+"""
+    output = llm.invoke(prompt)
+    return {"vocabulary": output.vocabulary}
 
-def validate_node(state: AgentState) -> dict:
-    """Validate with Pydantic + quality checks, optionally with LLM."""
-    json_text = state.get("json_text", "")
-    if not json_text:
-        return {"validation_feedback": "No output produced. Try again.", "result": None}
+def grammarian_node(state: AgentState):
+    llm = _get_llm().with_structured_output(GrammarianOutput)
+    prompt = f"""You are an expert German Grammarian for CEFR Level {state['target_level']}.
+Analyze the following news summary and highlight exactly 5 different grammar rules used in the text.
+Provide the rule name, a clear explanation in German, and the exact sentence from the summary where it is used.
+Make sure to explain rules suitable for {state['target_level']} (e.g. Perfekt/Nebensatz for B1, Passiv/Konjunktiv II for B2, Nominalstil/Konjunktiv I for C1).
 
-    # 1) Parse JSON
-    try:
-        parsed = json.loads(json_text)
-    except json.JSONDecodeError as e:
-        return {"validation_feedback": f"Invalid JSON: {e}", "result": None}
+Summary:
+{state['summary']}
+"""
+    output = llm.invoke(prompt)
+    return {"grammar_spotlights": output.grammar_spotlights}
 
-    # 2) Pydantic validation
-    try:
-        result = NewsBriefing(**parsed)
-    except ValidationError as e:
-        errors = "; ".join(err["msg"] for err in e.errors())
-        return {"validation_feedback": f"Schema errors: {errors}", "result": None}
-
-    # 3) Quality checks
-    issues = []
-    if len(result.bullet_points) < 4:
-        issues.append("Need at least 5 bullet points")
-    if len(result.vocabulary) < 6:
-        issues.append("Need at least 8 vocabulary items with example sentences")
-    if len(result.grammar_spotlights) < 2:
-        issues.append("Need 3 grammar spotlights with explanations and examples")
-    if len(result.summary) < 200:
-        issues.append("Summary is too short — need 4-6 detailed paragraphs")
-
-    if issues:
-        return {"validation_feedback": "; ".join(issues), "result": None}
-
-    # 4) LLM quality check on first attempt
-    if state.get("attempts", 0) <= 1:
-        try:
-            llm = _get_llm()
-            val_prompt = ChatPromptTemplate.from_messages([("human",
-                "You are a strict quality validator. Check this JSON news briefing for CEFR level "
-                "{target_level}. Is it well-written, comprehensive, and level-appropriate? "
-                "Does it have enough detail? If yes, reply EXACTLY: VALID. "
-                "Otherwise, briefly say what to fix.\n\nJSON:\n{json_text}"
-            )])
-            resp = (val_prompt | llm).invoke({
-                "target_level": state["target_level"],
-                "json_text": json_text,
-            })
-            feedback = resp.content.strip()
-            if "VALID" in feedback.upper() and len(feedback) < 30:
-                return {"result": result, "validation_feedback": ""}
-            else:
-                return {"validation_feedback": feedback, "result": None}
-        except Exception:
-            return {"result": result, "validation_feedback": ""}
-
-    return {"result": result, "validation_feedback": ""}
-
-
-def should_retry(state: AgentState) -> str:
-    if state.get("result") is not None:
-        return "done"
-    if state.get("attempts", 0) >= 3:
-        return "done"
-    if state.get("error"):
-        return "done"
-    return "retry"
-
+def compiler_node(state: AgentState):
+    result = NewsBriefing(
+        headline=state["headline"],
+        summary=state["summary"],
+        bullet_points=state["bullet_points"],
+        vocabulary=state["vocabulary"],
+        grammar_spotlights=state["grammar_spotlights"]
+    )
+    return {"result": result}
 
 def build_graph():
     graph = StateGraph(AgentState)
-    graph.add_node("rewrite", rewrite_node)
-    graph.add_node("validate", validate_node)
-    graph.add_edge(START, "rewrite")
-    graph.add_edge("rewrite", "validate")
-    graph.add_conditional_edges("validate", should_retry, {"retry": "rewrite", "done": END})
+    graph.add_node("journalist", journalist_node)
+    graph.add_node("lexicographer", lexicographer_node)
+    graph.add_node("grammarian", grammarian_node)
+    graph.add_node("compiler", compiler_node)
+    
+    # Sequential Pipeline
+    graph.add_edge(START, "journalist")
+    graph.add_edge("journalist", "lexicographer")
+    graph.add_edge("lexicographer", "grammarian")
+    graph.add_edge("grammarian", "compiler")
+    graph.add_edge("compiler", END)
+    
     return graph.compile()
 
-
 def generate_briefing(combined_text: str, level: str) -> NewsBriefing:
-    """Run the full LangGraph pipeline."""
+    """Run the Multi-Agent pipeline."""
     graph = build_graph()
     final = graph.invoke({
         "combined_text": combined_text,
         "target_level": level,
-        "json_text": "",
-        "result": None,
-        "validation_feedback": "",
-        "attempts": 0,
-        "error": "",
+        "headline": "",
+        "summary": "",
+        "bullet_points": [],
+        "vocabulary": [],
+        "grammar_spotlights": [],
+        "result": None
     })
-
+    
     if final.get("result"):
         return final["result"]
-
-    if final.get("json_text"):
-        try:
-            return NewsBriefing(**json.loads(final["json_text"]))
-        except Exception:
-            pass
-
-    raise RuntimeError(
-        f"Failed after {final.get('attempts', 0)} attempts. "
-        f"Error: {final.get('error', '')} | Feedback: {final.get('validation_feedback', '')}"
-    )
+        
+    raise RuntimeError("Multi-Agent pipeline failed to produce a final briefing.")
 
 
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  STREAMLIT UI                                                           ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
+# STREAMLIT UI                                                         
 
 st.set_page_config(
     page_title="🇩🇪 German News Agent",
@@ -350,7 +288,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── CSS ──────────────────────────────────────────────────────────────────────
+# CSS 
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
@@ -359,32 +297,30 @@ st.markdown("""
     html, body, .stApp {
         font-family: 'Inter', sans-serif;
     }
-    .stApp {
-        background: #000000; /* Pure Black Background */
-    }
 
     /* Header */
     .main-header {
         text-align: center;
         padding: 2.5rem 0 1rem;
-        border-bottom: 1px solid #333;
+        border-bottom: 1px solid rgba(128, 128, 128, 0.2);
         margin-bottom: 2rem;
     }
     .main-header h1 {
         font-size: 3rem;
         font-weight: 800;
-        color: #FFFFFF;
+        color: var(--text-color);
         text-transform: uppercase;
         letter-spacing: -0.02em;
         margin-bottom: 0.3rem;
     }
     .main-header p {
-        color: #888;
+        color: var(--text-color);
+        opacity: 0.7;
         font-size: 1.1rem;
         font-weight: 300;
     }
 
-    /* Level badges - Monochrome */
+    /* Level badges - Theme aware */
     .level-badge {
         display: inline-block;
         padding: 0.4rem 1.2rem;
@@ -393,105 +329,116 @@ st.markdown("""
         font-size: 0.8rem;
         letter-spacing: 0.1em;
         text-transform: uppercase;
-        border: 1px solid #FFFFFF;
+        border: 1px solid var(--text-color);
+        opacity: 0.9;
     }
-    .level-B1 { background: #333; color: #FFF; border-color: #444; }
-    .level-B2 { background: #666; color: #FFF; border-color: #777; }
-    .level-C1 { background: #FFF; color: #000; border-color: #FFF; }
+    .level-B1 { background: transparent; color: var(--text-color); }
+    .level-B2 { background: var(--secondary-background-color); color: var(--text-color); border: 1px solid transparent; }
+    .level-C1 { background: var(--text-color); color: var(--background-color); }
 
-    /* Glass card - High Contrast */
+    /* Glass card - Theme aware */
     .glass-card {
-        background: #111111;
-        border: 1px solid #222;
+        background: var(--secondary-background-color);
+        border: 1px solid rgba(128, 128, 128, 0.2);
         border-radius: 4px;
         padding: 2rem;
         margin-bottom: 1.5rem;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.05);
         transition: border-color 0.2s ease;
     }
-    .glass-card:hover {
-        border-color: #FFFFFF;
-    }
+    .glass-card:hover { border-color: var(--primary-color); }
     .glass-card h3 {
         margin-top: 0;
-        color: #FFFFFF;
+        color: var(--text-color);
         font-weight: 700;
         text-transform: uppercase;
         font-size: 0.9rem;
         letter-spacing: 0.1em;
-        border-bottom: 1px solid #222;
+        border-bottom: 1px solid rgba(128, 128, 128, 0.2);
         padding-bottom: 1rem;
         margin-bottom: 1.5rem;
     }
 
-    /* Vocab table - Monochrome */
+    /* Vocab table */
     .vocab-table {
         width: 100%;
         border-collapse: collapse;
     }
     .vocab-table th {
         text-align: left;
-        color: #666;
+        color: var(--text-color);
+        opacity: 0.7;
         font-weight: 600;
         font-size: 0.75rem;
         text-transform: uppercase;
         letter-spacing: 0.1em;
         padding: 0.8rem 1rem;
-        border-bottom: 1px solid #222;
+        border-bottom: 1px solid rgba(128, 128, 128, 0.2);
     }
     .vocab-table td {
         padding: 1rem;
-        color: #CCC;
+        color: var(--text-color);
+        opacity: 0.9;
         font-size: 0.95rem;
-        border-bottom: 1px solid #1a1a1a;
+        border-bottom: 1px solid rgba(128, 128, 128, 0.1);
     }
     .vocab-table tr td:first-child {
         font-weight: 700;
-        color: #FFFFFF;
+        opacity: 1;
     }
 
-    /* Bullet list - Minimalist */
+    /* Bullet list */
     .bullet-item {
-        border-left: 2px solid #FFFFFF;
+        border-left: 3px solid var(--primary-color);
         padding: 1rem 1.5rem;
         margin-bottom: 0.8rem;
-        background: #0a0a0a;
-        color: #BBB;
+        background: var(--background-color);
+        color: var(--text-color);
+        opacity: 0.9;
         font-size: 0.95rem;
     }
 
-    /* Grammar card - Inverted */
+    /* Grammar card */
     .grammar-card {
-        background: #FFFFFF;
-        color: #000000;
+        background: var(--background-color);
+        color: var(--text-color);
+        border: 1px solid rgba(128,128,128,0.2);
         border-radius: 4px;
         padding: 2rem;
+        margin-bottom: 1.5rem;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        word-wrap: break-word;
     }
     .grammar-card h3 { 
-        color: #000000 !important; 
+        color: var(--text-color) !important; 
         margin-top: 0; 
-        border-bottom: 1px solid #DDD;
+        border-bottom: 1px solid rgba(128,128,128,0.2);
         padding-bottom: 1rem;
         margin-bottom: 1.5rem;
     }
     .grammar-rule { 
-        color: #000000 !important; 
+        color: var(--text-color) !important; 
         font-weight: 800; 
         font-size: 1.2rem; 
         text-transform: uppercase;
     }
     .grammar-explanation { 
-        color: #333 !important; 
+        color: var(--text-color) !important; 
+        opacity: 0.8;
         margin: 1rem 0; 
         line-height: 1.6; 
+        flex-grow: 1;
     }
     .grammar-example {
-        background: #f0f0f0;
+        background: var(--secondary-background-color);
         border-radius: 2px;
         padding: 1.2rem;
-        color: #000 !important;
+        color: var(--text-color) !important;
         font-style: italic;
         font-size: 0.95rem;
-        border-left: 4px solid #000;
+        border-left: 4px solid var(--text-color);
         margin-top: 1rem;
     }
 
@@ -503,65 +450,55 @@ st.markdown("""
         font-weight: 700;
         margin-right: 0.5rem;
         text-transform: uppercase;
-        border: 1px solid #333;
+        border: 1px solid rgba(128,128,128,0.3);
     }
-    .source-dw { background: #000; color: #FFF; border-color: #444; }
-    .source-ts { background: #FFF; color: #000; border-color: #FFF; }
+    .source-dw { background: var(--text-color); color: var(--background-color); }
+    .source-ts { background: transparent; color: var(--text-color); }
 
     .meta-bar {
         display: flex;
         align-items: center;
         gap: 1.5rem;
         padding: 1rem 1.5rem;
-        background: #0a0a0a;
-        border: 1px solid #222;
+        background: var(--secondary-background-color);
+        border: 1px solid rgba(128,128,128,0.2);
         border-radius: 4px;
         margin-bottom: 2rem;
-        color: #666;
+        color: var(--text-color);
+        opacity: 0.8;
         font-size: 0.85rem;
     }
-    .meta-bar strong { color: #FFF; }
+    .meta-bar strong { color: var(--text-color); opacity: 1; }
 
     .graph-info {
-        background: #111;
-        border: 1px solid #333;
-        color: #888;
+        background: var(--background-color);
+        border: 1px solid rgba(128,128,128,0.2);
+        color: var(--text-color);
         padding: 1rem;
         font-size: 0.8rem;
         margin-top: 1rem;
         text-transform: uppercase;
         letter-spacing: 0.05em;
+        opacity: 0.8;
     }
 
-    section[data-testid="stSidebar"] {
-        background: #050505;
-        border-right: 1px solid #222;
-    }
+    /* Remove stSidebar explicit background */
 
-    /* Primary buttons as white-on-black */
-    div.stButton > button {
-        background-color: #FFFFFF !important;
-        color: #000000 !important;
-        border-radius: 2px !important;
+    /* Ensure primary buttons match Streamlit natively */
+    div.stButton > button[kind="primary"] {
         font-weight: 700 !important;
         text-transform: uppercase !important;
         letter-spacing: 0.1em !important;
-        border: none !important;
-        padding: 0.6rem 1rem !important;
-    }
-    div.stButton > button:hover {
-        background-color: #CCCCCC !important;
-        color: #000000 !important;
     }
 
-
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
+    /* Restored visibility for navigation elements */
+    #MainMenu {visibility: visible;}
+    footer {visibility: visible;}
+    header {visibility: visible;}
 </style>
 """, unsafe_allow_html=True)
 
-# ── Header ───────────────────────────────────────────────────────────────────
+#  Header 
 st.markdown("""
 <div class="main-header">
     <h1>🇩🇪 German News Agent</h1>
@@ -569,7 +506,7 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
+# Sidebar 
 with st.sidebar:
     st.markdown("### Settings")
 
@@ -587,16 +524,18 @@ with st.sidebar:
         refresh_minutes = st.slider(
             "Refresh every (minutes)", min_value=5, max_value=120, value=30, step=5
         )
-        st.info(f"🔄 Will auto-refresh every {refresh_minutes} min")
+        st.info(f"Will auto-refresh every {refresh_minutes} min")
 
     st.markdown("---")
     st.markdown("### Sources")
-    st.markdown(
-        "<span class='source-tag source-dw'>Deutsche Welle</span>"
-        "<span class='source-tag source-ts'>Tagesschau</span>",
-        unsafe_allow_html=True,
+    selected_sources = st.multiselect(
+        "Select preferred news sources:",
+        options=["Deutsche Welle", "Tagesschau"],
+        default=["Deutsche Welle", "Tagesschau"],
     )
-    st.caption("Top stories from both sources are combined into one briefing.")
+    if not selected_sources:
+        st.warning("Please select at least one source.")
+
 
 
     st.markdown("---")
@@ -606,7 +545,7 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-# ── Session State ────────────────────────────────────────────────────────────
+# Session State 
 if "briefing" not in st.session_state:
     st.session_state.briefing = None
 if "articles" not in st.session_state:
@@ -615,31 +554,53 @@ if "last_refresh" not in st.session_state:
     st.session_state.last_refresh = None
 if "fetch_time" not in st.session_state:
     st.session_state.fetch_time = None
+if "click_count" not in st.session_state:
+    st.session_state.click_count = 0
+if "translated_summary" not in st.session_state:
+    st.session_state.translated_summary = None
 
-# ── Auto-refresh logic ──────────────────────────────────────────────────────
+# Auto-refresh logic 
 needs_auto_refresh = False
 if auto_refresh and st.session_state.last_refresh:
     elapsed = (datetime.now() - st.session_state.last_refresh).total_seconds()
     if elapsed >= refresh_minutes * 60:
         needs_auto_refresh = True
 
-# ── Main Action ──────────────────────────────────────────────────────────────
+# Main Action
 col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
 with col_btn2:
-    get_summary = st.button(
-        "Get Latest Summary",
-        use_container_width=True,
-        type="primary",
-        help="Fetches latest news from DW & Tagesschau and creates a combined briefing",
-    )
+    search_query = st.text_input("🔍 Search topics (e.g. Politik, Wirtschaft) — Optional", value="")
+    st.markdown("<div style='margin-bottom: 0.5rem;'></div>", unsafe_allow_html=True) # Adds tiny space
+    remaining_clicks = 5 - st.session_state.click_count
+    
+    if st.session_state.click_count < 5:
+        get_summary = st.button(
+            f"Get Latest Summary ({remaining_clicks} left)",
+            use_container_width=True,
+            type="primary",
+            help="Fetches latest news from DW & Tagesschau and creates a combined briefing",
+        )
+    else:
+        st.button("Limit Reached (5/5)", use_container_width=True, disabled=True)
+        st.error("You have reached the limit of 5 summaries for this session.")
+        get_summary = False
 
-should_generate = get_summary or needs_auto_refresh
+should_generate = (get_summary or needs_auto_refresh) and st.session_state.click_count < 5
 
 if should_generate:
+    if not selected_sources:
+        st.error("Cannot fetch news: No sources were selected in the sidebar.")
+        st.stop()
+
+    # Increment counter
+    if get_summary:
+        st.session_state.click_count += 1
+    # Reset translation on new fetch
+    st.session_state.translated_summary = None
     # Step 1: Fetch
-    with st.spinner(" Fetching latest news from Deutsche Welle & Tagesschau..."):
+    with st.spinner(" Fetching latest news and running Journalist, Lexicographer, and Grammarian Agents..."):
         try:
-            articles, combined_text = fetch_all_news()
+            articles, combined_text = fetch_all_news(top_n=5, selected_sources=selected_sources, search_query=search_query)
             st.session_state.articles = articles
             st.session_state.fetch_time = datetime.now()
         except Exception as e:
@@ -663,7 +624,7 @@ if should_generate:
             st.error(f"Error generating briefing: {e}")
             st.stop()
 
-# ── Display Briefing ─────────────────────────────────────────────────────────
+# Display Briefing 
 if st.session_state.briefing:
     briefing: NewsBriefing = st.session_state.briefing
     articles = st.session_state.articles
@@ -684,50 +645,78 @@ if st.session_state.briefing:
 
     # Headline
     st.markdown(
-        f"<div class='glass-card'><h2 style='color:#FFF; margin:0;'>"
+        f"<div class='glass-card'><h2 style='color:var(--text-color); margin:0;'>"
         f"{briefing.headline}</h2></div>",
         unsafe_allow_html=True,
     )
 
-    # ── Row 1: Summary + Key Points ──────────────────────────────────────
+    # Row 1: Summary + Key Points
     col_left, col_right = st.columns([3, 2])
 
     with col_left:
-        formatted_summary = briefing.summary.replace("\n\n", "</p><p style='color:#ccd6f6; line-height:1.8; margin-top:0.8rem;'>")
+        formatted_summary = briefing.summary.replace("\n\n", "</p><p style='color:var(--text-color); opacity:0.9; line-height:1.8; margin-top:0.8rem;'>")
         formatted_summary = formatted_summary.replace("\n", "<br>")
         st.markdown(
-            f"<div class='glass-card'><h3>News Briefing</h3>"
-            f"<p style='color:#ccd6f6; line-height:1.8; font-size:1rem;'>"
+            f"<div class='glass-card' style='margin-bottom: 1rem;'><h3>News Briefing</h3>"
+            f"<p style='color:var(--text-color); opacity:0.9; line-height:1.8; font-size:1rem;'>"
             f"{formatted_summary}</p></div>",
             unsafe_allow_html=True,
         )
 
-    with col_right:
-        st.markdown("<div class='glass-card'><h3>Key Points</h3>", unsafe_allow_html=True)
-        for bp in briefing.bullet_points:
-            st.markdown(f"<div class='bullet-item'>{bp}</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        # Sources (compact)
-        st.markdown("<div class='glass-card'><h3>Sources</h3>", unsafe_allow_html=True)
-        for a in articles[:10]:
-            tag_class = "source-dw" if a["source"] == "Deutsche Welle" else "source-ts"
+        # Translate Button & Display 
+        if not st.session_state.translated_summary:
+            if st.button("Translate to English", use_container_width=True):
+                with st.spinner("Translating summary..."):
+                    llm = _get_llm()
+                    from langchain_core.messages import SystemMessage, HumanMessage
+                    resp = llm.invoke([
+                        SystemMessage(content="You are a professional translator. Translate the following German news summary into English. Maintain a precise and neutral journalistic tone."),
+                        HumanMessage(content=briefing.summary)
+                    ])
+                    st.session_state.translated_summary = resp.content
+                    st.rerun()
+        else:
+            eng_summary = st.session_state.translated_summary.replace("\n\n", "</p><p style='color:var(--text-color); opacity:0.8; line-height:1.8; margin-top:0.8rem;'>")
+            eng_summary = eng_summary.replace("\n", "<br>")
             st.markdown(
-                f"<div style='margin-bottom:0.5rem;'>"
-                f"<span class='source-tag {tag_class}'>{a['source']}</span>"
-                f"<a href='{a['url']}' target='_blank' style='color:#8892b0; "
-                f"text-decoration:none; font-size:0.85rem;'>{a['title']}</a></div>",
+                f"<div class='glass-card' style='background: var(--background-color); border-left: 4px solid var(--primary-color); padding: 1.5rem; margin-bottom: 1rem;'>"
+                f"<h4 style='color: var(--primary-color); margin-top: 0; margin-bottom: 1rem;'>🇬🇧 English Translation</h4>"
+                f"<p style='color:var(--text-color); opacity:0.8; line-height:1.8; font-size:0.95rem; margin: 0;'>"
+                f"{eng_summary}</p></div>",
                 unsafe_allow_html=True,
             )
-        st.markdown("</div>", unsafe_allow_html=True)
+            if st.button("Hide Translation", use_container_width=True):
+                st.session_state.translated_summary = None
+                st.rerun()
 
-    # ── Row 2: Vocabulary (full width) ───────────────────────────────────
+    with col_right:
+        # Key Points
+        kp_html = "<div class='glass-card'><h3>Key Points</h3>"
+        for bp in briefing.bullet_points:
+            kp_html += f"<div class='bullet-item'>{bp}</div>"
+        kp_html += "</div>"
+        st.markdown(kp_html, unsafe_allow_html=True)
+
+        # Sources (compact)
+        src_html = "<div class='glass-card'><h3>Sources</h3>"
+        for a in articles[:10]:
+            tag_class = "source-dw" if a["source"] == "Deutsche Welle" else "source-ts"
+            src_html += (
+                f"<div style='margin-bottom:0.5rem;'>"
+                f"<span class='source-tag {tag_class}'>{a['source']}</span>"
+                f"<a href='{a['url']}' target='_blank' style='color:var(--primary-color); "
+                f"text-decoration:none; font-size:0.85rem;'>{a['title']}</a></div>"
+            )
+        src_html += "</div>"
+        st.markdown(src_html, unsafe_allow_html=True)
+
+    # Row 2: Vocabulary (full width) 
     st.markdown("---")
     vocab_rows = ""
     for v in briefing.vocabulary:
         vocab_rows += (
             f"<tr><td>{v.word}</td><td>{v.translation}</td>"
-            f"<td style='font-style:italic; color:#8892b0;'>{v.example}</td></tr>"
+            f"<td style='font-style:italic; color:var(--text-color); opacity:0.7;'>{v.example}</td></tr>"
         )
     st.markdown(
         f"<div class='glass-card'><h3>Vocabulary — {target_level} Level ({len(briefing.vocabulary)} Words)</h3>"
@@ -737,33 +726,52 @@ if st.session_state.briefing:
         unsafe_allow_html=True,
     )
 
-    # ── Row 3: Grammar Spotlights (3 cards side by side) ─────────────────
+    # Row 3: Grammar Spotlights (5 cards in 2 rows) 
     st.markdown("---")
-    grammar_cols = st.columns(len(briefing.grammar_spotlights))
-    for i, gs in enumerate(briefing.grammar_spotlights):
-        with grammar_cols[i]:
+
+    # Row A: first 3 grammar spotlights
+    row_a = briefing.grammar_spotlights[:3]
+    cols_a = st.columns(3)
+    for i, gs in enumerate(row_a):
+        with cols_a[i]:
             st.markdown(
                 f"<div class='grammar-card'>"
                 f"<h3>Grammar {i+1}</h3>"
                 f"<div class='grammar-rule'>{gs.rule_name}</div>"
                 f"<div class='grammar-explanation'>{gs.explanation}</div>"
-                f"<div class='grammar-example'>„{gs.example_from_text}</div>"
+                f"<div class='grammar-example'>„{gs.example_from_text}“</div>"
                 f"</div>",
                 unsafe_allow_html=True,
             )
+
+    # Row B: remaining grammar spotlights
+    row_b = briefing.grammar_spotlights[3:]
+    if row_b:
+        cols_b = st.columns(len(row_b))
+        for j, gs in enumerate(row_b):
+            with cols_b[j]:
+                st.markdown(
+                    f"<div class='grammar-card'>"
+                    f"<h3>Grammar {j+4}</h3>"
+                    f"<div class='grammar-rule'>{gs.rule_name}</div>"
+                    f"<div class='grammar-explanation'>{gs.explanation}</div>"
+                    f"<div class='grammar-example'>„{gs.example_from_text}“</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
 
 else:
     # Welcome screen
     st.markdown("""
     <div style="text-align:center; padding: 4rem 2rem;">
         <div style="font-size: 4rem; margin-bottom: 1rem;"> 🇩🇪 </div>
-        <h2 style="color: #ccd6f6; font-weight: 300; margin-bottom: 1rem;">
+        <h2 style="color: var(--text-color); font-weight: 300; margin-bottom: 1rem;">
             Your Daily German News Briefing
         </h2>
-        <p style="color: #8892b0; max-width: 550px; margin: 0 auto; line-height: 1.7;">
-            Click <strong style="color:#ffd700;">Get Latest Summary</strong> to fetch the latest
-            news from <strong style="color:#00a8e8;">Deutsche Welle</strong> and
-            <strong style="color:#5eb1ef;">Tagesschau</strong>, combined into a single
+        <p style="color: var(--text-color); opacity: 0.8; max-width: 550px; margin: 0 auto; line-height: 1.7;">
+            Click <strong style="color: var(--text-color);">Get Latest Summary</strong> to fetch the latest
+            news from <strong style="color: var(--primary-color);">Deutsche Welle</strong> and
+            <strong style="color: var(--primary-color);">Tagesschau</strong>, combined into a single
             comprehensive briefing at your CEFR level with vocabulary and grammar highlights.
         </p>
         <div style="margin-top: 2rem; display: flex; justify-content: center; gap: 1rem;">
@@ -771,16 +779,16 @@ else:
             <span class="level-badge level-B2">B2 Upper-Intermediate</span>
             <span class="level-badge level-C1">C1 Advanced</span>
         </div>
-        <div style="margin-top: 2rem; color: #8892b0; font-size: 0.85rem;">
+        <div style="margin-top: 2rem; color: var(--text-color); opacity: 0.6; font-size: 0.85rem;">
              Enable auto-refresh in the sidebar for scheduled updates
         </div>
-        <div style="margin-top: 0.5rem; color: #00cec9; font-size: 0.8rem;">
-             Quality validated with LangGraph (Rewrite → Validate → Retry)
+        <div style="margin-top: 0.5rem; color: var(--primary-color); font-size: 0.8rem;">
+             LangGraph Multi-Agent Architecture
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-# ── Auto-refresh timer (triggers rerun at the right time) ────────────────────
+# Auto-refresh timer (triggers rerun at the right time)
 if auto_refresh and st.session_state.last_refresh:
     elapsed = (datetime.now() - st.session_state.last_refresh).total_seconds()
     remaining = max(0, refresh_minutes * 60 - elapsed)
