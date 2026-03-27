@@ -8,18 +8,29 @@ import os
 import json
 import re
 import time
+import calendar
 import requests
 import feedparser
 import streamlit as st
 from datetime import datetime
 from typing import List, Optional, TypedDict
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from dotenv import load_dotenv
+
+def get_german_time() -> datetime:
+    try:
+        from zoneinfo import ZoneInfo
+        # Strip timezone info after calculation to prevent naive/aware comparison crashes 
+        # with old session states during live reloads
+        return datetime.now(ZoneInfo("Europe/Berlin")).replace(tzinfo=None)
+    except Exception:
+        return datetime.now()
 from pydantic import BaseModel, Field, ValidationError
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 
-load_dotenv()
+load_dotenv(override=True)
 
 # PYDANTIC MODELS                                                       
 
@@ -51,19 +62,178 @@ class NewsBriefing(BaseModel):
 import concurrent.futures
 
 DW_FEEDS = [
-    "https://rss.dw.com/rdf/rss-de-top",
-    "https://rss.dw.com/rdf/rss-de-eco",
-    "https://rss.dw.com/rdf/rss-de-science",
-    "https://rss.dw.com/rdf/rss-de-culture",
-    "https://rss.dw.com/rdf/rss-de-sports",
+    "https://rss.dw.com/xml/rss-de-all",
+    "https://rss.dw.com/xml/rss-de-top",
+    "https://rss.dw.com/xml/rss-de-news",
+    "https://rss.dw.com/xml/rss-de-eco",
+    "https://rss.dw.com/xml/rss-de-wissenschaft",
+    "https://rss.dw.com/xml/rss-de-sport",
+    "https://rss.dw.com/xml/rss-de-cul",
+    "https://rss.dw.com/xml/rss-de-cul-buch",
+    "https://rss.dw.com/xml/rss-de-cul-film",
+    "https://rss.dw.com/xml/rss-de-cul-musik",
+    "https://rss.dw.com/xml/rss-de-deutschlandentdecken",
 ]
 
+# TAGESSCHAU_FEEDS = [
+#     "https://www.tagesschau.de/infoservices/alle-meldungen-100~rss2.xml",
+#     "https://www.tagesschau.de/index~rss2.xml",
+#     "https://www.tagesschau.de/inland/index~rss2.xml",
+#     "https://www.tagesschau.de/inland/innenpolitik/index~rss2.xml",
+#     "https://www.tagesschau.de/inland/gesellschaft/index~rss2.xml",
+#     "https://www.tagesschau.de/wirtschaft/index~rss2.xml",
+#     "https://www.tagesschau.de/wirtschaft/finanzen/index~rss2.xml",
+#     "https://www.tagesschau.de/wirtschaft/unternehmen/index~rss2.xml",
+#     "https://www.tagesschau.de/wirtschaft/verbraucher/index~rss2.xml",
+#     "https://www.tagesschau.de/wirtschaft/technologie/index~rss2.xml",
+#     "https://www.tagesschau.de/wirtschaft/weltwirtschaft/index~rss2.xml",
+#     "https://www.tagesschau.de/wirtschaft/konjunktur/index~rss2.xml",
+#     "https://www.tagesschau.de/wissen/index~rss2.xml",
+#     "https://www.tagesschau.de/wissen/gesundheit/index~rss2.xml",
+#     "https://www.tagesschau.de/wissen/klima/index~rss2.xml",
+#     "https://www.tagesschau.de/wissen/forschung/index~rss2.xml",
+#     "https://www.tagesschau.de/wissen/technologie/index~rss2.xml",
+#     "https://www.tagesschau.de/ausland/index~rss2.xml",
+#     "https://www.tagesschau.de/ausland/europa/index~rss2.xml",
+#     "https://www.tagesschau.de/ausland/amerika/index~rss2.xml",
+#     "https://www.tagesschau.de/ausland/afrika/index~rss2.xml",
+#     "https://www.tagesschau.de/ausland/asien/index~rss2.xml",
+#     "https://www.tagesschau.de/faktenfinder/index~rss2.xml",
+#     "https://www.tagesschau.de/investigativ/index~rss2.xml",
+# ]
+
 TAGESSCHAU_FEEDS = [
-    "https://www.tagesschau.de/index~rss2.xml",
+    # Top / All News
+    "https://www.tagesschau.de/infoservices/alle-meldungen-100~rss2.xml",
+    
+    # Business & Tech
     "https://www.tagesschau.de/wirtschaft/index~rss2.xml",
-    "https://www.tagesschau.de/wissen/index~rss2.xml",
+    "https://www.tagesschau.de/wirtschaft/finanzen/index~rss2.xml",
+    "https://www.tagesschau.de/wirtschaft/technologie/index~rss2.xml",
+    "https://www.tagesschau.de/wirtschaft/unternehmen/index~rss2.xml",
+    "https://www.tagesschau.de/wirtschaft/konjunktur/index~rss2.xml",
+    
+    # Politics & World
+    "https://www.tagesschau.de/inland/index~rss2.xml",
     "https://www.tagesschau.de/ausland/index~rss2.xml",
+    "https://www.tagesschau.de/ausland/europa/index~rss2.xml",
+    "https://www.tagesschau.de/ausland/amerika/index~rss2.xml",
+    "https://www.tagesschau.de/ausland/asien/index~rss2.xml",
+    "https://www.tagesschau.de/ausland/afrika/index~rss2.xml",
+    
+    # Science, Health & Climate
+    "https://www.tagesschau.de/wissen/index~rss2.xml",
+    "https://www.tagesschau.de/wissen/gesundheit/index~rss2.xml",
+    "https://www.tagesschau.de/wissen/klima/index~rss2.xml",
+    "https://www.tagesschau.de/wissen/forschung/index~rss2.xml",
+    
+    # Sports (Including Sportschau for details)
+    "https://www.tagesschau.de/sport/index~rss2.xml",
+    "https://www.sportschau.de/fussball/index~rss2.xml",
+    "https://www.sportschau.de/olympia/index~rss2.xml",
+    
+    # Society & Deep Dives
+    "https://www.tagesschau.de/inland/gesellschaft/index~rss2.xml",
+    "https://www.tagesschau.de/investigativ/index~rss2.xml",
+    "https://www.tagesschau.de/faktenfinder/index~rss2.xml"
 ]
+
+ARTICLES_PER_FEED = 25
+ARTICLE_AGENT_POOL_SIZE = 20
+ARTICLE_FINDER_SHORTLIST_SIZE = 10
+ALLOWED_FUTURE_SKEW_SECONDS = 300
+
+
+def _normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def _strip_html(text: str) -> str:
+    return _normalize_whitespace(re.sub(r"<[^>]+>", " ", text or ""))
+
+
+def _clean_article_url(url: str) -> str:
+    if not url:
+        return ""
+
+    parts = urlsplit(url)
+    filtered_query = [
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if not key.lower().startswith("utm_") and key.lower() not in {"maca"}
+    ]
+    cleaned_path = parts.path.rstrip("/") or parts.path
+    return urlunsplit((parts.scheme, parts.netloc.lower(), cleaned_path, urlencode(filtered_query), ""))
+
+
+def _extract_timestamp(entry) -> float:
+    for attr in ("published_parsed", "updated_parsed", "created_parsed"):
+        parsed_value = getattr(entry, attr, None)
+        if parsed_value:
+            try:
+                return float(calendar.timegm(parsed_value))
+            except Exception:
+                continue
+    return 0.0
+
+
+def _article_lookup_text(article: dict) -> str:
+    return _normalize_whitespace(
+        " ".join(
+            [
+                article.get("title", ""),
+                article.get("description", ""),
+                article.get("full_text", ""),
+            ]
+        )
+    ).lower()
+
+
+def _extract_entry_full_text(entry) -> str:
+    parts = []
+
+    for key in ("summary", "description"):
+        value = entry.get(key, "")
+        if value:
+            parts.append(_strip_html(value))
+
+    for content_item in entry.get("content", []) or []:
+        if isinstance(content_item, dict):
+            value = content_item.get("value", "")
+            if value:
+                parts.append(_strip_html(value))
+
+    return _normalize_whitespace(" ".join(part for part in parts if part))
+
+
+def _extract_search_keywords(search_query: str) -> list[str]:
+    stopwords = {
+        "der", "die", "das", "und", "oder", "mit", "ohne", "für", "fur", "von",
+        "den", "dem", "des", "ein", "eine", "einer", "eines", "im", "in", "am",
+        "an", "auf", "zu", "zum", "zur", "bei", "nach", "vor", "über", "uber",
+        "the", "and", "for", "latest", "news",
+    }
+    tokens = re.findall(r"\w+", (search_query or "").lower())
+    return [token for token in tokens if len(token) > 2 and token not in stopwords]
+
+
+def _keyword_match_score(article: dict, search_query: str, keywords: list[str]) -> int:
+    if not search_query:
+        return 0
+
+    haystack = _article_lookup_text(article)
+    score = 0
+    normalized_query = _normalize_whitespace(search_query).lower()
+    if normalized_query and normalized_query in haystack:
+        score += 12
+
+    for keyword in keywords:
+        if keyword in haystack:
+            score += 3
+            if keyword in article.get("title", "").lower():
+                score += 2
+
+    return score
 
 
 def _parse_feed(url: str, source_name: str, max_items: int = 8) -> list[dict]:
@@ -71,18 +241,258 @@ def _parse_feed(url: str, source_name: str, max_items: int = 8) -> list[dict]:
     feed = feedparser.parse(url)
     articles = []
     for entry in feed.entries[:max_items]:
-        title = entry.get("title", "")
+        title = _normalize_whitespace(entry.get("title", ""))
         desc = entry.get("summary", entry.get("description", ""))
-        desc = re.sub(r"<[^>]+>", "", desc).strip()
+        desc = _strip_html(desc)
+        full_text = _extract_entry_full_text(entry)
+        cleaned_url = _clean_article_url(entry.get("link", ""))
         if title.strip():
+            timestamp = _extract_timestamp(entry)
             articles.append({
                 "title": title,
                 "description": desc,
+                "full_text": full_text,
                 "source": source_name,
-                "url": entry.get("link", ""),
+                "url": cleaned_url,
                 "published": entry.get("published", ""),
+                "timestamp": timestamp,
             })
     return articles
+
+
+class ArticleFinderOutput(BaseModel):
+    selected_urls: List[str] = Field(description="Ordered list of the best candidate article URLs")
+
+
+class ArticleEvaluationItem(BaseModel):
+    url: str = Field(description="Candidate article URL")
+    is_relevant: bool = Field(description="True if this article clearly matches the search query")
+    reason: str = Field(description="Short explanation for the decision")
+
+
+class ArticleEvaluatorOutput(BaseModel):
+    evaluations: List[ArticleEvaluationItem] = Field(description="Relevance decisions for candidate articles")
+
+
+def _build_article_candidate_block(articles: list[dict], search_query: str = "") -> str:
+    keywords = _extract_search_keywords(search_query)
+    lines = []
+    for index, article in enumerate(articles, start=1):
+        match_score = _keyword_match_score(article, search_query, keywords)
+        lines.append(
+            "\n".join(
+                [
+                    f"[{index}] URL: {article['url']}",
+                    f"Source: {article['source']}",
+                    f"Published: {article.get('published') or 'Unknown'}",
+                    f"Timestamp: {int(article.get('timestamp', 0) or 0)}",
+                    f"KeywordScore: {match_score}",
+                    f"Title: {article['title']}",
+                    f"Description: {article['description']}",
+                ]
+            )
+        )
+    return "\n\n".join(lines)
+
+
+def _fallback_select_articles(candidate_articles: list[dict], top_n: int, search_query: str = "") -> list[dict]:
+    keywords = _extract_search_keywords(search_query)
+    if search_query:
+        ranked = sorted(
+            candidate_articles,
+            key=lambda article: (
+                _keyword_match_score(article, search_query, keywords),
+                article.get("timestamp", 0),
+            ),
+            reverse=True,
+        )
+    else:
+        ranked = sorted(candidate_articles, key=lambda article: article.get("timestamp", 0), reverse=True)
+    return ranked[:top_n]
+
+
+def _select_articles_with_finder_agent(candidate_articles: list[dict], top_n: int, search_query: str = "") -> list[dict]:
+    if not candidate_articles:
+        return []
+
+    llm = _get_llm().with_structured_output(ArticleFinderOutput)
+    shortlist_target = min(len(candidate_articles), max(top_n, ARTICLE_FINDER_SHORTLIST_SIZE))
+    current_time = get_german_time().strftime("%Y-%m-%d %H:%M:%S")
+    query_text = search_query.strip() or "No keyword filter. Focus on the latest distinct stories."
+    prompt = f"""You are the Article Finder Agent for a German news briefing app.
+Current time in Germany: {current_time}
+Search query: {query_text}
+
+Choose the strongest shortlist from the candidates below.
+
+Rules:
+- Return only URLs that already appear in the candidate list.
+- Prefer articles published on or before the current time.
+- Prefer the newest items.
+- When a search query exists, strongly prioritize direct relevance to that query and close variants.
+- Avoid near-duplicates unless they clearly add new information.
+- Keep a healthy mix of sources when quality is similar.
+- Return between {top_n} and {shortlist_target} URLs in best-first order.
+
+Candidates:
+{_build_article_candidate_block(candidate_articles, search_query)}
+"""
+
+    try:
+        output = llm.invoke(prompt)
+        chosen_urls = []
+        seen = set()
+        by_url = {article["url"]: article for article in candidate_articles}
+        for url in output.selected_urls:
+            cleaned = _clean_article_url(url)
+            if cleaned in by_url and cleaned not in seen:
+                chosen_urls.append(cleaned)
+                seen.add(cleaned)
+        selected = [by_url[url] for url in chosen_urls]
+        if selected:
+            return selected[:shortlist_target]
+    except Exception:
+        pass
+
+    return _fallback_select_articles(candidate_articles, shortlist_target, search_query)
+
+
+def _evaluate_articles_with_keyword_agent(selected_articles: list[dict], search_query: str, top_n: int) -> list[dict]:
+    if not selected_articles:
+        return []
+
+    llm = _get_llm().with_structured_output(ArticleEvaluatorOutput)
+    prompt = f"""You are the Evaluator Agent for article relevance.
+Search query: {search_query}
+
+Check whether each article is genuinely relevant to the search query.
+
+Rules:
+- Mark is_relevant true only for clear, direct matches.
+- Reject weak or merely tangential mentions.
+- Consider the title and description together.
+- Return decisions for every URL listed below.
+
+Candidates:
+{_build_article_candidate_block(selected_articles, search_query)}
+"""
+
+    try:
+        output = llm.invoke(prompt)
+        approved_urls = {
+            _clean_article_url(item.url)
+            for item in output.evaluations
+            if item.is_relevant
+        }
+        approved = [article for article in selected_articles if article["url"] in approved_urls]
+        if approved:
+            return approved[:top_n]
+    except Exception:
+        pass
+
+    keywords = _extract_search_keywords(search_query)
+    return [
+        article
+        for article in selected_articles
+        if _keyword_match_score(article, search_query, keywords) > 0
+    ][:top_n]
+
+
+def curate_articles_with_agents(all_articles: list[dict], top_n: int = 5, search_query: str = "") -> list[dict]:
+    if not all_articles:
+        return []
+
+    now_ts = get_german_time().timestamp()
+    recent_articles = [
+        article
+        for article in all_articles
+        if not article.get("timestamp") or article["timestamp"] <= now_ts + ALLOWED_FUTURE_SKEW_SECONDS
+    ]
+    if not recent_articles:
+        recent_articles = list(all_articles)
+
+    keywords = _extract_search_keywords(search_query)
+    if search_query:
+        ranked_candidates = sorted(
+            recent_articles,
+            key=lambda article: (
+                _keyword_match_score(article, search_query, keywords),
+                article.get("timestamp", 0),
+            ),
+            reverse=True,
+        )
+    else:
+        ranked_candidates = sorted(recent_articles, key=lambda article: article.get("timestamp", 0), reverse=True)
+
+    candidate_pool = ranked_candidates[:ARTICLE_AGENT_POOL_SIZE]
+    if search_query.strip():
+        candidate_pool = enrich_articles_for_keyword_search(candidate_pool, search_query=search_query)
+        candidate_pool = sorted(
+            candidate_pool,
+            key=lambda article: (
+                _keyword_match_score(article, search_query, keywords),
+                article.get("timestamp", 0),
+            ),
+            reverse=True,
+        )
+    shortlisted = _select_articles_with_finder_agent(candidate_pool, top_n=top_n, search_query=search_query)
+
+    if not search_query.strip():
+        return shortlisted[:top_n]
+
+    approved = _evaluate_articles_with_keyword_agent(shortlisted, search_query=search_query, top_n=top_n)
+    if len(approved) >= top_n:
+        return approved[:top_n]
+
+    remaining_candidates = [article for article in candidate_pool if article["url"] not in {a["url"] for a in shortlisted}]
+    if remaining_candidates:
+        approved.extend(
+            _evaluate_articles_with_keyword_agent(
+                remaining_candidates,
+                search_query=search_query,
+                top_n=max(top_n - len(approved), 0),
+            )
+        )
+
+    deduped = []
+    seen_urls = set()
+    for article in approved:
+        if article["url"] and article["url"] not in seen_urls:
+            deduped.append(article)
+            seen_urls.add(article["url"])
+
+    return deduped[:top_n]
+
+
+def enrich_articles_for_keyword_search(candidate_articles: list[dict], search_query: str) -> list[dict]:
+    if not search_query.strip() or not candidate_articles:
+        return candidate_articles
+
+    enriched_articles = [dict(article) for article in candidate_articles]
+    indexes_to_fetch = [
+        index
+        for index, article in enumerate(enriched_articles)
+        if article.get("url") and len(article.get("full_text", "")) < 240
+    ][: min(len(enriched_articles), ARTICLE_FINDER_SHORTLIST_SIZE)]
+
+    if not indexes_to_fetch:
+        return enriched_articles
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(indexes_to_fetch))) as executor:
+        future_map = {
+            executor.submit(try_enrich_article, enriched_articles[index]["url"]): index
+            for index in indexes_to_fetch
+        }
+        for future in concurrent.futures.as_completed(future_map):
+            index = future_map[future]
+            try:
+                full_text = future.result()
+            except Exception:
+                full_text = None
+            if full_text:
+                enriched_articles[index]["full_text"] = full_text
+
+    return enriched_articles
 
 
 def fetch_all_news(top_n: int = 5, selected_sources: list[str] = None, search_query: str = "") -> tuple[list[dict], str]:
@@ -93,48 +503,65 @@ def fetch_all_news(top_n: int = 5, selected_sources: list[str] = None, search_qu
     if selected_sources is None:
         selected_sources = ["Deutsche Welle", "Tagesschau"]
 
+    search_mode = bool(search_query.strip())
+    dw_feed_urls = [DW_FEEDS[0]] if search_mode else DW_FEEDS
+    ts_feed_urls = [TAGESSCHAU_FEEDS[0]] if search_mode else TAGESSCHAU_FEEDS
+
     # Fetch more items upfront to allow for search filtering
     def _fetch_concurrently(feed_urls, source_name):
         results = []
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = [executor.submit(_parse_feed, f, source_name, 30) for f in feed_urls]
+            futures = [executor.submit(_parse_feed, f, source_name, ARTICLES_PER_FEED) for f in feed_urls]
             for future in concurrent.futures.as_completed(futures):
-                results.extend(future.result())
+                try:
+                    results.extend(future.result())
+                except Exception:
+                    continue
         
         # Deduplicate
         seen = set()
         unique = []
         for a in results:
-            if a['url'] not in seen:
-                seen.add(a['url'])
+            dedupe_key = a["url"] or f"{a['source']}::{a['title'].lower()}"
+            if dedupe_key not in seen:
+                seen.add(dedupe_key)
                 unique.append(a)
-        return unique
+        return sorted(unique, key=lambda article: article.get("timestamp", 0), reverse=True)
 
-    dw_articles = _fetch_concurrently(DW_FEEDS, "Deutsche Welle") if "Deutsche Welle" in selected_sources else []
-    ts_articles = _fetch_concurrently(TAGESSCHAU_FEEDS, "Tagesschau") if "Tagesschau" in selected_sources else []
-
-    if search_query:
-        query = search_query.lower()
-        dw_articles = [a for a in dw_articles if query in a["title"].lower() or query in a["description"].lower()]
-        ts_articles = [a for a in ts_articles if query in a["title"].lower() or query in a["description"].lower()]
+    dw_articles = _fetch_concurrently(dw_feed_urls, "Deutsche Welle") if "Deutsche Welle" in selected_sources else []
+    ts_articles = _fetch_concurrently(ts_feed_urls, "Tagesschau") if "Tagesschau" in selected_sources else []
 
     # Interleave to get a balanced mix of both sources
     all_articles = []
-    max_len = max(len(dw_articles), len(ts_articles))
+    max_len = max(len(dw_articles), len(ts_articles), 1)
     for i in range(max_len):
         if i < len(dw_articles):
             all_articles.append(dw_articles[i])
         if i < len(ts_articles):
             all_articles.append(ts_articles[i])
 
-    # Take top N
-    all_articles = all_articles[:top_n]
+    # Let the finder and evaluator agents finalize the latest relevant set
+    all_articles = curate_articles_with_agents(all_articles, top_n=top_n, search_query=search_query)
+
+    if search_mode and not all_articles:
+        dw_articles = _fetch_concurrently(DW_FEEDS, "Deutsche Welle") if "Deutsche Welle" in selected_sources else []
+        ts_articles = _fetch_concurrently(TAGESSCHAU_FEEDS, "Tagesschau") if "Tagesschau" in selected_sources else []
+
+        fallback_articles = []
+        max_len = max(len(dw_articles), len(ts_articles), 1)
+        for i in range(max_len):
+            if i < len(dw_articles):
+                fallback_articles.append(dw_articles[i])
+            if i < len(ts_articles):
+                fallback_articles.append(ts_articles[i])
+
+        all_articles = curate_articles_with_agents(fallback_articles, top_n=top_n, search_query=search_query)
 
     # Build a combined text block for the LLM
     text_parts = []
     for i, a in enumerate(all_articles, 1):
         text_parts.append(
-            f"[{i}] ({a['source']}) {a['title']}\n{a['description']}"
+            f"[{i}] ({a['source']}) {a['title']}\n{a['description']}\n{a.get('full_text', '')}"
         )
     combined_text = "\n\n".join(text_parts)
 
@@ -181,10 +608,18 @@ class GrammarianOutput(BaseModel):
     grammar_spotlights: List[GrammarSpotlight] = Field(description="Exactly 5 grammar rule spotlights used in the summary, with examples from the text")
 
 def _get_llm():
-    api_key = os.getenv("OPENAI_API_KEY")
+    # Try Streamlit Cloud secrets first, then local .env
+    api_key = None
+    try:
+        api_key = st.secrets["OPENAI_API_KEY"]
+    except (KeyError, FileNotFoundError, AttributeError):
+        api_key = os.getenv("OPENAI_API_KEY")
+    
     if not api_key or api_key == "your_openai_api_key_here":
         raise ValueError(
-            "OPENAI_API_KEY is not set. Add it to your .env file.\n"
+            "OPENAI_API_KEY is not set.\n"
+            "Local: Add it to your .env file.\n"
+            "Streamlit Cloud: Add it in App Settings → Secrets.\n"
             "Get a key at https://platform.openai.com/api-keys"
         )
     return ChatOpenAI(model="gpt-4o-mini", temperature=0.3, api_key=api_key)
@@ -562,7 +997,7 @@ if "translated_summary" not in st.session_state:
 # Auto-refresh logic 
 needs_auto_refresh = False
 if auto_refresh and st.session_state.last_refresh:
-    elapsed = (datetime.now() - st.session_state.last_refresh).total_seconds()
+    elapsed = (get_german_time() - st.session_state.last_refresh).total_seconds()
     if elapsed >= refresh_minutes * 60:
         needs_auto_refresh = True
 
@@ -575,7 +1010,7 @@ with col_btn2:
     
     if st.session_state.click_count < 5:
         get_summary = st.button(
-            f"Get Latest Summary ({remaining_clicks} left)",
+            f"Get Latest Summary",
             use_container_width=True,
             type="primary",
             help="Fetches latest news from DW & Tagesschau and creates a combined briefing",
@@ -598,17 +1033,17 @@ if should_generate:
     # Reset translation on new fetch
     st.session_state.translated_summary = None
     # Step 1: Fetch
-    with st.spinner(" Fetching latest news and running Journalist, Lexicographer, and Grammarian Agents..."):
+    with st.spinner(" Fetching feeds and running Finder, Evaluator, Journalist, Lexicographer, and Grammarian Agents..."):
         try:
             articles, combined_text = fetch_all_news(top_n=5, selected_sources=selected_sources, search_query=search_query)
             st.session_state.articles = articles
-            st.session_state.fetch_time = datetime.now()
+            st.session_state.fetch_time = get_german_time()
         except Exception as e:
             st.error(f"Error fetching news: {e}")
             st.stop()
 
     if not articles:
-        st.warning("No articles found. Please try again later.")
+        st.warning("No matching articles were found. Try again later or broaden the search keyword.")
         st.stop()
 
     # Step 2: Generate briefing
@@ -619,7 +1054,7 @@ if should_generate:
         try:
             briefing = generate_briefing(combined_text, target_level)
             st.session_state.briefing = briefing
-            st.session_state.last_refresh = datetime.now()
+            st.session_state.last_refresh = get_german_time()
         except Exception as e:
             st.error(f"Error generating briefing: {e}")
             st.stop()
@@ -790,7 +1225,7 @@ else:
 
 # Auto-refresh timer (triggers rerun at the right time)
 if auto_refresh and st.session_state.last_refresh:
-    elapsed = (datetime.now() - st.session_state.last_refresh).total_seconds()
+    elapsed = (get_german_time() - st.session_state.last_refresh).total_seconds()
     remaining = max(0, refresh_minutes * 60 - elapsed)
     if remaining > 0:
         time.sleep(min(remaining, 5))  # check every 5 seconds
