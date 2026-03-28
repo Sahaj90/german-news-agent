@@ -976,7 +976,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown(
         "<div style='color:#8892b0; font-size:0.78rem; text-align:center;'>"
-        "Powered by OpenAI · DW · Tagesschau</div>",
+        "OpenAI · DW · Tagesschau</div>",
         unsafe_allow_html=True,
     )
 
