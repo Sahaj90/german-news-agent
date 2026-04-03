@@ -12,7 +12,7 @@ import calendar
 import requests
 import feedparser
 import streamlit as st
-# from streamlit_autorefresh import st_autorefresh
+from streamlit_autorefresh import st_autorefresh
 from datetime import datetime
 from typing import List, Optional, TypedDict
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -727,7 +727,7 @@ st.set_page_config(
 # Keep-alive heartbeat: silently refreshes the page every 10 minutes.
 # This resets Streamlit Community Cloud's 12-hour inactivity timer
 # so the app stays awake as long as any visitor has it open in their browser.
-# st_autorefresh(interval=10 * 60 * 1000, key="keepalive_refresh")
+st_autorefresh(interval=10 * 60 * 1000, key="keepalive_refresh")
 
 # CSS 
 st.markdown("""
